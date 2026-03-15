@@ -1,0 +1,75 @@
+Ольга Стакина, 8 937 989 1131 - 20 минут 
+
+Ключевые условия:
+Сессия — это цепочка событий, где между любыми двумя соседними событиями проходит не более 5 минут.
+Сессия может длиться хоть 30 минут, если пользователь активен (события идут часто).
+Нас интересуют только события event = 'template_selected'.
+«Подряд» означает: пользователь выбрал шаблон X, затем (без других выборов шаблонов в промежутке) снова выбрал X.
+
+Шаг 1: Разметка сессий (CTE sessions)
+Цель: Каждому событию присвоить номер сессии (session_id), чтобы потом группировать события правильно.
+Как это работает:
+Берем все события пользователя, сортируем по времени.
+Для каждого события смотрим на предыдущее событие этого же пользователя (LAG(event_time)).
+Считаем разницу во времени:
+Если разницы нет (это первое событие) ИЛИ разница > 5 минут → это начало новой сессии (ставим флаг 1).
+Иначе → событие продолжается в текущей сессии (ставим флаг 0).
+Применяем SUM() OVER (...) — эта функция накапливает флаги. Каждый раз, когда встречается 1, сумма увеличивается, и мы получаем новый session_id.
+
+Шаг 2: Фильтрация шаблонов и поиск предыдущего (CTE template_events)
+Цель: Оставить только события выбора шаблона и для каждого из них найти, какой шаблон был выбран до этого в той же сессии.
+Как это работает:
+Берем данные из sessions и фильтруем: WHERE event = 'template_selected'.
+Используем LAG(value) OVER (PARTITION BY user_id, session_id ORDER BY event_time):
+PARTITION BY user_id, session_id — гарантирует, что мы смотрим только внутри одной сессии одного пользователя.
+ORDER BY event_time — смотрим строго по порядку.
+Получаем столбец prev_template — название шаблона, выбранного непосредственно перед текущим.
+
+Шаг 3: Подсчет повторов и Топ-5 (финальный SELECT)
+Цель: Оставить только те строки, где шаблон повторился, и посчитать, какие шаблоны лидируют.
+Как это работает:
+WHERE template_name = prev_template — оставляем только строки, где текущий шаблон совпадает с предыдущим.
+Первая строка с prev_template = NULL отфильтруется автоматически (NULL = 'pop_art' → UNKNOWN → не проходит).
+GROUP BY template_name — группируем все повторы по названию шаблона.
+COUNT(*) — считаем, сколько раз каждый шаблон был выбран как повтор (интенсивность повторений).
+ORDER BY ... DESC LIMIT 5 — выводим топ-5.
+
+
+
+WITH sessions AS (
+    -- Шаг 1: Разметка сессий
+    -- Новая сессия начинается, если с предыдущего события пользователя прошло > 5 минут
+    SELECT
+        user_id,
+        event,
+        event_time,
+        value,
+        SUM(
+            CASE 
+                WHEN LAG(event_time) OVER (PARTITION BY user_id ORDER BY event_time) IS NULL 
+                     OR event_time - LAG(event_time) OVER (PARTITION BY user_id ORDER BY event_time) > INTERVAL '5 minutes'
+                THEN 1 
+                ELSE 0 
+            END
+        ) OVER (PARTITION BY user_id ORDER BY event_time) AS session_id
+    FROM logs
+),
+template_events AS (
+    -- Шаг 2: Фильтруем выбор шаблонов и смотрим предыдущий шаблон в рамках сессии
+    SELECT
+        user_id,
+        session_id,
+        value AS template_name,
+        LAG(value) OVER (PARTITION BY user_id, session_id ORDER BY event_time) AS prev_template
+    FROM sessions
+    WHERE event = 'template_selected'
+)
+-- Шаг 3: Считаем шаблоны, которые повторялись подряд (2+ раза)
+SELECT
+    template_name,
+    COUNT(*) AS consecutive_count
+FROM template_events
+WHERE template_name = prev_template  -- шаблон совпадает с предыдущим = повтор подряд
+GROUP BY template_name
+ORDER BY consecutive_count DESC
+LIMIT 5;
